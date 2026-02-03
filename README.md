@@ -40,7 +40,7 @@ wp-local-push setup
 This will:
 
 - Create a config file at `~/.config/wp-local-push/config`
-- Add an FTP login entry to `~/.netrc`
+- Store FTP credentials in macOS Keychain
 - Create an `lftp` bookmark so you can connect via a short name
 
 ## Push a theme or plugin
@@ -62,5 +62,5 @@ wp-local-push doctor
 
 ## Security notes
 
-- Credentials are stored in `~/.netrc` and that file is set to permission `600`.
-- If you don’t want the wizard to write credentials, you can create/edit `~/.netrc` yourself and then re-run `wp-local-push setup`.
+- Credentials are stored in macOS Keychain (service name: `wp-local-push`).
+- If you change your FTP password, re-run `wp-local-push setup` to update Keychain.

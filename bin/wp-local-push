@@ -2,6 +2,7 @@
 set -euo pipefail
 
 APP_NAME="wp-local-push"
+KEYCHAIN_SERVICE="wp-local-push"
 
 CONFIG_DIR_DEFAULT="${XDG_CONFIG_HOME:-$HOME/.config}/wp-local-push"
 CONFIG_FILE_DEFAULT="$CONFIG_DIR_DEFAULT/config"
@@ -50,6 +51,8 @@ load_config() {
   set -u
 
   [[ -n "${LOCAL_SITES_DIR:-}" ]] || return 1
+  [[ -n "${FTP_HOST:-}" ]] || return 1
+  [[ -n "${FTP_USERNAME:-}" ]] || return 1
   [[ -n "${LFTP_BOOKMARK:-}" ]] || return 1
   [[ -n "${REMOTE_WP_ROOT:-}" ]] || return 1
   return 0
@@ -77,37 +80,57 @@ prompt_secret() {
   echo "$value"
 }
 
-netrc_upsert() {
-  local host login password netrc
+keychain_get_password() {
+  local host
   host="$1"
-  login="$2"
-  password="$3"
-  netrc="$HOME/.netrc"
+  security find-generic-password -a "$host" -s "$KEYCHAIN_SERVICE" -w 2>/dev/null || true
+}
 
-  touch "$netrc"
-  chmod 600 "$netrc" || true
+keychain_set_password() {
+  local host password
+  host="$1"
+  password="$2"
+  security add-generic-password -a "$host" -s "$KEYCHAIN_SERVICE" -w "$password" -U >/dev/null 2>&1
+}
 
-  local host_esc
-  host_esc=$(printf '%s' "$host" | sed -e 's/[\\\\\[\\\]().^$?+*{|}\/]/\\\\&/g')
+keychain_has_password() {
+  local host
+  host="$1"
+  security find-generic-password -a "$host" -s "$KEYCHAIN_SERVICE" >/dev/null 2>&1
+}
 
-  if grep -qE "^[[:space:]]*machine[[:space:]]+$host_esc([[:space:]]|$)" "$netrc" 2>/dev/null; then
-    die "~/.netrc already contains an entry for '$host'. Please edit it manually or remove the existing entry and re-run setup."
-  fi
+lftp_exec() {
+  local target cmd host username password
+  target="$1"
+  cmd="$2"
+  host="$3"
+  username="$4"
 
-  {
-    echo
-    echo "machine $host"
-    echo "  login $login"
-    echo "  password $password"
-  } >>"$netrc"
+  password="$(keychain_get_password "$host")"
+  [[ -n "$password" ]] || die "No keychain password found for '$host'. Run: $APP_NAME setup"
 
-  chmod 600 "$netrc" || true
+  lftp -u "$username,$password" "$target" -e "$cmd" >/dev/null 2>&1
+}
+
+lftp_exec_quiet() {
+  local target cmd host username password
+  target="$1"
+  cmd="$2"
+  host="$3"
+  username="$4"
+
+  password="$(keychain_get_password "$host")"
+  [[ -n "$password" ]] || return 1
+
+  lftp -u "$username,$password" "$target" -e "$cmd" >/dev/null 2>&1
 }
 
 lftp_test() {
-  local bookmark
-  bookmark="$1"
-  lftp "$bookmark" -e "pwd; quit" >/dev/null 2>&1
+  local target host username
+  target="$1"
+  host="$2"
+  username="$3"
+  lftp_exec_quiet "$target" "pwd; quit" "$host" "$username"
 }
 
 choose_remote_root() {
@@ -140,6 +163,7 @@ normalize_remote_root() {
 
 cmd_setup() {
   need_cmd lftp
+  need_cmd security
 
   if ! command -v fzf >/dev/null 2>&1; then
     echo "$APP_NAME: fzf is not installed."
@@ -158,41 +182,31 @@ cmd_setup() {
     [[ "$overwrite" == "y" || "$overwrite" == "Y" ]] || exit 0
   fi
 
-  local local_sites_dir host bookmark username password remote_wp_root write_netrc
+  local local_sites_dir host bookmark username password remote_wp_root
   local_sites_dir=$(prompt "Local sites folder" "$HOME/Local Sites")
   host=$(prompt "FTP host (e.g. myserver.com)" "")
   bookmark=$(prompt "lftp bookmark name" "mywp")
 
-  write_netrc=$(prompt "Store FTP credentials in ~/.netrc? (y/N)" "N")
-  if [[ "$write_netrc" == "y" || "$write_netrc" == "Y" ]]; then
-    username=$(prompt "FTP username" "")
-    password=$(prompt_secret "FTP password (will be stored in ~/.netrc)")
-  else
-    username=""
-    password=""
-  fi
+  username=$(prompt "FTP username" "")
+  password=$(prompt_secret "FTP password (stored in macOS Keychain)")
 
   [[ -n "$host" ]] || die "Host is required"
   [[ -n "$bookmark" ]] || die "Bookmark is required"
-  if [[ "$write_netrc" == "y" || "$write_netrc" == "Y" ]]; then
-    [[ -n "$username" ]] || die "Username is required"
-    [[ -n "$password" ]] || die "Password is required"
+  [[ -n "$username" ]] || die "Username is required"
+  [[ -n "$password" ]] || die "Password is required"
 
-    if grep -qE "^[[:space:]]*machine[[:space:]]+$host([[:space:]]|$)" "$HOME/.netrc" 2>/dev/null; then
-      local use_existing
-      use_existing=$(prompt "~/.netrc already has an entry for '$host'. Use existing entry? (Y/n)" "Y")
-      [[ "$use_existing" == "y" || "$use_existing" == "Y" || -z "$use_existing" ]] || die "Refusing to modify ~/.netrc. Please edit it manually and re-run setup."
-    else
-      netrc_upsert "$host" "$username" "$password"
-    fi
-  else
-    echo "$APP_NAME: skipping ~/.netrc. Ensure you can connect with: lftp $host"
+  if keychain_has_password "$host"; then
+    local overwrite
+    overwrite=$(prompt "Keychain already has credentials for '$host'. Overwrite? (y/N)" "N")
+    [[ "$overwrite" == "y" || "$overwrite" == "Y" ]] || die "Refusing to overwrite Keychain entry."
   fi
 
-  if lftp "$host" -e "bookmark add $bookmark; quit" >/dev/null 2>&1; then
+  keychain_set_password "$host" "$password"
+
+  if lftp_exec_quiet "$host" "bookmark add $bookmark; quit" "$host" "$username"; then
     :
   else
-    if lftp_test "$bookmark"; then
+    if lftp_test "$bookmark" "$host" "$username"; then
       echo "$APP_NAME: using existing lftp bookmark '$bookmark'"
     else
       die "Failed to create or use lftp bookmark '$bookmark'"
@@ -203,25 +217,37 @@ cmd_setup() {
 
   {
     echo "LOCAL_SITES_DIR=\"$local_sites_dir\""
+    echo "FTP_HOST=\"$host\""
+    echo "FTP_USERNAME=\"$username\""
     echo "LFTP_BOOKMARK=\"$bookmark\""
     echo "REMOTE_WP_ROOT=\"$remote_wp_root\""
   } >"$config"
 
-  if lftp_test "$bookmark"; then
+  if lftp_test "$bookmark" "$host" "$username"; then
     echo "$APP_NAME: setup complete."
   else
-    die "Could not connect using lftp bookmark '$bookmark'. Check ~/.netrc and connectivity."
+    die "Could not connect using lftp bookmark '$bookmark'. Check Keychain entry and connectivity."
   fi
 }
 
 cmd_doctor() {
   local ok
   ok=1
+  local has_security
+  has_security=0
 
   if command -v lftp >/dev/null 2>&1; then
     echo "$APP_NAME: lftp ok"
   else
     echo "$APP_NAME: lftp missing (macOS: brew install lftp)"
+    ok=0
+  fi
+
+  if command -v security >/dev/null 2>&1; then
+    echo "$APP_NAME: security ok"
+    has_security=1
+  else
+    echo "$APP_NAME: security missing (macOS Keychain CLI unavailable)"
     ok=0
   fi
 
@@ -233,7 +259,16 @@ cmd_doctor() {
 
   if load_config; then
     echo "$APP_NAME: config ok ($(config_file))"
-    if lftp_test "$LFTP_BOOKMARK"; then
+    if [[ "$has_security" -eq 1 ]]; then
+      if keychain_has_password "$FTP_HOST"; then
+        echo "$APP_NAME: keychain ok ($FTP_HOST)"
+      else
+        echo "$APP_NAME: keychain missing entry for $FTP_HOST"
+        ok=0
+      fi
+    fi
+
+    if lftp_test "$LFTP_BOOKMARK" "$FTP_HOST" "$FTP_USERNAME"; then
       echo "$APP_NAME: lftp connection ok ($LFTP_BOOKMARK)"
     else
       echo "$APP_NAME: lftp connection failed ($LFTP_BOOKMARK)"
@@ -250,6 +285,7 @@ cmd_doctor() {
 cmd_push() {
   need_cmd lftp
   need_cmd fzf
+  need_cmd security
 
   if ! load_config; then
     echo "$APP_NAME: no config found. Starting setup..."
@@ -284,6 +320,7 @@ cmd_push() {
 
   local site type local_base item local_path remote_path
   local remote_sites remote_site remote_root remote_site_root
+  local password
   site=$(ls "$LOCAL_SITES_DIR" | fzf --prompt="Select Local Site > " || true)
   [[ -n "${site:-}" ]] || exit 1
 
@@ -301,7 +338,10 @@ cmd_push() {
 
   remote_root=$(normalize_remote_root "$REMOTE_WP_ROOT")
 
-  remote_sites=$(lftp "$LFTP_BOOKMARK" -e "cd '$remote_root'; cls -1 --dirs-only; quit" 2>/dev/null || true)
+  password="$(keychain_get_password "$FTP_HOST")"
+  [[ -n "$password" ]] || die "No keychain password found for '$FTP_HOST'. Run: $APP_NAME setup"
+
+  remote_sites=$(lftp -u "$FTP_USERNAME,$password" "$LFTP_BOOKMARK" -e "cd '$remote_root'; cls -1 --dirs-only; quit" 2>/dev/null || true)
   remote_site=$(printf "%s\n" "$remote_sites" | awk 'NF' | fzf --prompt="Select Remote Site > " || true)
   [[ -n "${remote_site:-}" ]] || die "No remote site selected"
 
@@ -321,7 +361,7 @@ cmd_push() {
   confirm=$(prompt "Proceed? (y/N)" "N")
   [[ "$confirm" == "y" || "$confirm" == "Y" ]] || exit 0
 
-  lftp "$LFTP_BOOKMARK" -e "mirror -R$mirror_flags '$local_path' '$remote_path'; quit"
+  lftp -u "$FTP_USERNAME,$password" "$LFTP_BOOKMARK" -e "mirror -R$mirror_flags '$local_path' '$remote_path'; quit"
 
   echo "$APP_NAME: done."
 }
