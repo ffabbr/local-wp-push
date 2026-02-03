@@ -18,7 +18,7 @@ brew install lftp fzf
 ### Option A: clone repo + run installer
 
 ```bash
-git clone <YOUR_GITHUB_REPO_URL>
+git clone https://github.com/ffabbr/local-wp-push.git
 cd wp-local-push
 ./install.sh
 ```
@@ -64,24 +64,3 @@ wp-local-push doctor
 
 - Credentials are stored in `~/.netrc` and that file is set to permission `600`.
 - If you don’t want the wizard to write credentials, you can create/edit `~/.netrc` yourself and then re-run `wp-local-push setup`.
-
-## Publishing this on GitHub (your steps)
-
-1. Create a new GitHub repository (e.g. `wp-local-push`).
-2. In this folder:
-
-```bash
-git init
-git add .
-git commit -m "Initial release"
-```
-
-3. Add your GitHub remote and push:
-
-```bash
-git remote add origin git@github.com:<YOUR_USER>/<YOUR_REPO>.git
-git branch -M main
-git push -u origin main
-```
-
-4. (Optional) Create a GitHub Release so people can pin a version.

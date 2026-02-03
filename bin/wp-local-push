@@ -115,14 +115,27 @@ choose_remote_root() {
   bookmark="$1"
 
   if command -v fzf >/dev/null 2>&1; then
-    selection=$(lftp "$bookmark" -e "cls -1; quit" 2>/dev/null | fzf --prompt="Select remote WP root folder (e.g. public_html, stage, etc.) > " || true)
+    selection=$(lftp "$bookmark" -e "cls -1; quit" 2>/dev/null | awk 'NF' | { printf "/\n"; cat; } | fzf --prompt="Select remote sites root (choose / for server root) > " || true)
     if [[ -n "${selection:-}" ]]; then
-      echo "/$selection"
+      if [[ "$selection" == "/" ]]; then
+        echo "/"
+      else
+        echo "/$selection"
+      fi
       return 0
     fi
   fi
 
-  echo "$(prompt "Remote WP root path (absolute, e.g. /public_html or /rohlik-stage)" "/public_html")"
+  echo "$(prompt "Remote sites root path (absolute, e.g. /public_html or /)" "/public_html")"
+}
+
+normalize_remote_root() {
+  local path
+  path="$1"
+  if [[ "$path" != "/" ]]; then
+    path="${path%/}"
+  fi
+  echo "$path"
 }
 
 cmd_setup() {
@@ -270,6 +283,7 @@ cmd_push() {
   [[ -d "$LOCAL_SITES_DIR" ]] || die "Local sites folder not found: $LOCAL_SITES_DIR"
 
   local site type local_base item local_path remote_path
+  local remote_sites remote_site remote_root remote_site_root
   site=$(ls "$LOCAL_SITES_DIR" | fzf --prompt="Select Local Site > " || true)
   [[ -n "${site:-}" ]] || exit 1
 
@@ -285,7 +299,19 @@ cmd_push() {
   local_path="$local_base/$item"
   [[ -d "$local_path" ]] || die "Local item path not found: $local_path"
 
-  remote_path="$REMOTE_WP_ROOT/wp-content/$type/$item"
+  remote_root=$(normalize_remote_root "$REMOTE_WP_ROOT")
+
+  remote_sites=$(lftp "$LFTP_BOOKMARK" -e "cd '$remote_root'; cls -1 --dirs-only; quit" 2>/dev/null || true)
+  remote_site=$(printf "%s\n" "$remote_sites" | awk 'NF' | fzf --prompt="Select Remote Site > " || true)
+  [[ -n "${remote_site:-}" ]] || die "No remote site selected"
+
+  if [[ "$remote_root" == "/" ]]; then
+    remote_site_root="/$remote_site"
+  else
+    remote_site_root="$remote_root/$remote_site"
+  fi
+
+  remote_path="$remote_site_root/wp-content/$type/$item"
 
   echo
   echo "Local : $local_path"
