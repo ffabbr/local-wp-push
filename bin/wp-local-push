@@ -1,0 +1,327 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+APP_NAME="wp-local-push"
+
+CONFIG_DIR_DEFAULT="${XDG_CONFIG_HOME:-$HOME/.config}/wp-local-push"
+CONFIG_FILE_DEFAULT="$CONFIG_DIR_DEFAULT/config"
+
+usage() {
+  cat <<'EOF'
+wp-local-push
+
+Usage:
+  wp-local-push setup
+  wp-local-push push [--delete] [--dry-run]
+  wp-local-push doctor
+
+Config:
+  Stored at ~/.config/wp-local-push/config (or $XDG_CONFIG_HOME/wp-local-push/config)
+EOF
+}
+
+die() {
+  echo "$APP_NAME: $*" >&2
+  exit 1
+}
+
+need_cmd() {
+  command -v "$1" >/dev/null 2>&1 || die "Missing dependency: $1"
+}
+
+ensure_config_dir() {
+  mkdir -p "$CONFIG_DIR_DEFAULT"
+}
+
+config_file() {
+  echo "$CONFIG_FILE_DEFAULT"
+}
+
+load_config() {
+  local f
+  f="$(config_file)"
+  if [[ ! -f "$f" ]]; then
+    return 1
+  fi
+
+  set +u
+  # shellcheck disable=SC1090
+  source "$f"
+  set -u
+
+  [[ -n "${LOCAL_SITES_DIR:-}" ]] || return 1
+  [[ -n "${LFTP_BOOKMARK:-}" ]] || return 1
+  [[ -n "${REMOTE_WP_ROOT:-}" ]] || return 1
+  return 0
+}
+
+prompt() {
+  local label default value
+  label="$1"
+  default="${2:-}"
+
+  if [[ -n "$default" ]]; then
+    read -r -p "$label [$default]: " value
+    echo "${value:-$default}"
+  else
+    read -r -p "$label: " value
+    echo "$value"
+  fi
+}
+
+prompt_secret() {
+  local label value
+  label="$1"
+  read -r -s -p "$label: " value
+  echo
+  echo "$value"
+}
+
+netrc_upsert() {
+  local host login password netrc
+  host="$1"
+  login="$2"
+  password="$3"
+  netrc="$HOME/.netrc"
+
+  touch "$netrc"
+  chmod 600 "$netrc" || true
+
+  local host_esc
+  host_esc=$(printf '%s' "$host" | sed -e 's/[\\\\\[\\\]().^$?+*{|}\/]/\\\\&/g')
+
+  if grep -qE "^[[:space:]]*machine[[:space:]]+$host_esc([[:space:]]|$)" "$netrc" 2>/dev/null; then
+    die "~/.netrc already contains an entry for '$host'. Please edit it manually or remove the existing entry and re-run setup."
+  fi
+
+  {
+    echo
+    echo "machine $host"
+    echo "  login $login"
+    echo "  password $password"
+  } >>"$netrc"
+
+  chmod 600 "$netrc" || true
+}
+
+lftp_test() {
+  local bookmark
+  bookmark="$1"
+  lftp "$bookmark" -e "pwd; quit" >/dev/null 2>&1
+}
+
+choose_remote_root() {
+  local bookmark selection
+  bookmark="$1"
+
+  if command -v fzf >/dev/null 2>&1; then
+    selection=$(lftp "$bookmark" -e "cls -1; quit" 2>/dev/null | fzf --prompt="Select remote WP root folder (e.g. public_html, stage, etc.) > " || true)
+    if [[ -n "${selection:-}" ]]; then
+      echo "/$selection"
+      return 0
+    fi
+  fi
+
+  echo "$(prompt "Remote WP root path (absolute, e.g. /public_html or /rohlik-stage)" "/public_html")"
+}
+
+cmd_setup() {
+  need_cmd lftp
+
+  if ! command -v fzf >/dev/null 2>&1; then
+    echo "$APP_NAME: fzf is not installed."
+    echo "$APP_NAME: Install it (macOS): brew install fzf"
+    echo "$APP_NAME: Setup can continue, but interactive selection will be limited."
+  fi
+
+  ensure_config_dir
+
+  local config
+  config="$(config_file)"
+
+  if [[ -f "$config" ]]; then
+    local overwrite
+    overwrite=$(prompt "Config already exists at $config. Overwrite? (y/N)" "N")
+    [[ "$overwrite" == "y" || "$overwrite" == "Y" ]] || exit 0
+  fi
+
+  local local_sites_dir host bookmark username password remote_wp_root write_netrc
+  local_sites_dir=$(prompt "Local sites folder" "$HOME/Local Sites")
+  host=$(prompt "FTP host (e.g. myserver.com)" "")
+  bookmark=$(prompt "lftp bookmark name" "mywp")
+
+  write_netrc=$(prompt "Store FTP credentials in ~/.netrc? (y/N)" "N")
+  if [[ "$write_netrc" == "y" || "$write_netrc" == "Y" ]]; then
+    username=$(prompt "FTP username" "")
+    password=$(prompt_secret "FTP password (will be stored in ~/.netrc)")
+  else
+    username=""
+    password=""
+  fi
+
+  [[ -n "$host" ]] || die "Host is required"
+  [[ -n "$bookmark" ]] || die "Bookmark is required"
+  if [[ "$write_netrc" == "y" || "$write_netrc" == "Y" ]]; then
+    [[ -n "$username" ]] || die "Username is required"
+    [[ -n "$password" ]] || die "Password is required"
+
+    if grep -qE "^[[:space:]]*machine[[:space:]]+$host([[:space:]]|$)" "$HOME/.netrc" 2>/dev/null; then
+      local use_existing
+      use_existing=$(prompt "~/.netrc already has an entry for '$host'. Use existing entry? (Y/n)" "Y")
+      [[ "$use_existing" == "y" || "$use_existing" == "Y" || -z "$use_existing" ]] || die "Refusing to modify ~/.netrc. Please edit it manually and re-run setup."
+    else
+      netrc_upsert "$host" "$username" "$password"
+    fi
+  else
+    echo "$APP_NAME: skipping ~/.netrc. Ensure you can connect with: lftp $host"
+  fi
+
+  if lftp "$host" -e "bookmark add $bookmark; quit" >/dev/null 2>&1; then
+    :
+  else
+    if lftp_test "$bookmark"; then
+      echo "$APP_NAME: using existing lftp bookmark '$bookmark'"
+    else
+      die "Failed to create or use lftp bookmark '$bookmark'"
+    fi
+  fi
+
+  remote_wp_root=$(choose_remote_root "$bookmark")
+
+  {
+    echo "LOCAL_SITES_DIR=\"$local_sites_dir\""
+    echo "LFTP_BOOKMARK=\"$bookmark\""
+    echo "REMOTE_WP_ROOT=\"$remote_wp_root\""
+  } >"$config"
+
+  if lftp_test "$bookmark"; then
+    echo "$APP_NAME: setup complete."
+  else
+    die "Could not connect using lftp bookmark '$bookmark'. Check ~/.netrc and connectivity."
+  fi
+}
+
+cmd_doctor() {
+  local ok
+  ok=1
+
+  if command -v lftp >/dev/null 2>&1; then
+    echo "$APP_NAME: lftp ok"
+  else
+    echo "$APP_NAME: lftp missing (macOS: brew install lftp)"
+    ok=0
+  fi
+
+  if command -v fzf >/dev/null 2>&1; then
+    echo "$APP_NAME: fzf ok"
+  else
+    echo "$APP_NAME: fzf missing (macOS: brew install fzf)"
+  fi
+
+  if load_config; then
+    echo "$APP_NAME: config ok ($(config_file))"
+    if lftp_test "$LFTP_BOOKMARK"; then
+      echo "$APP_NAME: lftp connection ok ($LFTP_BOOKMARK)"
+    else
+      echo "$APP_NAME: lftp connection failed ($LFTP_BOOKMARK)"
+      ok=0
+    fi
+  else
+    echo "$APP_NAME: config missing/invalid. Run: wp-local-push setup"
+    ok=0
+  fi
+
+  [[ "$ok" -eq 1 ]] || exit 1
+}
+
+cmd_push() {
+  need_cmd lftp
+  need_cmd fzf
+
+  if ! load_config; then
+    echo "$APP_NAME: no config found. Starting setup..."
+    cmd_setup
+    load_config || die "Setup did not produce a valid config"
+  fi
+
+  local mirror_flags
+  mirror_flags=""
+
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --delete)
+        mirror_flags="$mirror_flags --delete"
+        shift
+        ;;
+      --dry-run)
+        mirror_flags="$mirror_flags --dry-run"
+        shift
+        ;;
+      -h|--help)
+        usage
+        exit 0
+        ;;
+      *)
+        die "Unknown argument: $1"
+        ;;
+    esac
+  done
+
+  [[ -d "$LOCAL_SITES_DIR" ]] || die "Local sites folder not found: $LOCAL_SITES_DIR"
+
+  local site type local_base item local_path remote_path
+  site=$(ls "$LOCAL_SITES_DIR" | fzf --prompt="Select Local Site > " || true)
+  [[ -n "${site:-}" ]] || exit 1
+
+  type=$(printf "themes\nplugins\n" | fzf --prompt="Sync Theme or Plugin > " || true)
+  [[ -n "${type:-}" ]] || exit 1
+
+  local_base="$LOCAL_SITES_DIR/$site/app/public/wp-content/$type"
+  [[ -d "$local_base" ]] || die "Path not found: $local_base"
+
+  item=$(ls "$local_base" | fzf --prompt="Select $type > " || true)
+  [[ -n "${item:-}" ]] || exit 1
+
+  local_path="$local_base/$item"
+  [[ -d "$local_path" ]] || die "Local item path not found: $local_path"
+
+  remote_path="$REMOTE_WP_ROOT/wp-content/$type/$item"
+
+  echo
+  echo "Local : $local_path"
+  echo "Remote: $remote_path"
+
+  local confirm
+  confirm=$(prompt "Proceed? (y/N)" "N")
+  [[ "$confirm" == "y" || "$confirm" == "Y" ]] || exit 0
+
+  lftp "$LFTP_BOOKMARK" -e "mirror -R$mirror_flags '$local_path' '$remote_path'; quit"
+
+  echo "$APP_NAME: done."
+}
+
+main() {
+  local cmd
+  cmd="${1:-}"
+  shift || true
+
+  case "$cmd" in
+    setup)
+      cmd_setup "$@"
+      ;;
+    push)
+      cmd_push "$@"
+      ;;
+    doctor)
+      cmd_doctor "$@"
+      ;;
+    -h|--help|help|"")
+      usage
+      ;;
+    *)
+      die "Unknown command: $cmd"
+      ;;
+  esac
+}
+
+main "$@"
