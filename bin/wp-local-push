@@ -302,6 +302,9 @@ cmd_push() {
   remote_root=$(normalize_remote_root "$REMOTE_WP_ROOT")
 
   remote_sites=$(lftp "$LFTP_BOOKMARK" -e "cd '$remote_root'; cls -1 --dirs-only; quit" 2>/dev/null || true)
+  if [[ -z "${remote_sites:-}" ]]; then
+    remote_sites=$(lftp "$LFTP_BOOKMARK" -e "cd '$remote_root'; cls -1; quit" 2>/dev/null || true)
+  fi
   remote_site=$(printf "%s\n" "$remote_sites" | awk 'NF' | fzf --prompt="Select Remote Site > " || true)
   [[ -n "${remote_site:-}" ]] || die "No remote site selected"
 
