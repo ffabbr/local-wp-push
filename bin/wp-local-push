@@ -306,6 +306,8 @@ cmd_push() {
     remote_sites=$(lftp "$LFTP_BOOKMARK" -e "cd '$remote_root'; cls -1; quit" 2>/dev/null || true)
   fi
   remote_site=$(printf "%s\n" "$remote_sites" | awk 'NF' | fzf --prompt="Select Remote Site > " || true)
+  remote_site="${remote_site#/}"
+  remote_site="${remote_site%/}"
   [[ -n "${remote_site:-}" ]] || die "No remote site selected"
 
   if [[ "$remote_root" == "/" ]]; then
